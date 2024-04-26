@@ -1,85 +1,102 @@
-use gtk::prelude::*;
-use gtk::{Application, ApplicationWindow};
-use gtk::{Box, Button, Entry};
+use gstreamer as gst;
 use gtk4 as gtk;
-use reqwest;
-use serde_json::{json, Value};
 
-fn get_video_info(id: &str) -> String {
-    // https://tyrrrz.me/blog/reverse-engineering-youtube-revisited
-    // https://github.com/Tyrrrz/YoutubeExplode
+use std::sync::OnceLock;
+use tokio::runtime::{Runtime, Builder};
+use gst::prelude::*;
+use gtk::gdk;
+use gtk::{prelude::*, Application, ApplicationWindow, Picture};
+use std::env;
+mod gstlib;
+mod ytlib;
 
-    let client = reqwest::blocking::Client::new();
-
-    client
-        .post("https://www.youtube.com/youtubei/v1/player")
-        .header(
-            "User-Agent",
-            "com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip",
-        )
-        .json(&json!({
-            "videoId": id,
-            "context": {
-                "client": {
-                    "clientName": "ANDROID_TESTSUITE",
-                    "clientVersion": "1.9",
-                    "androidSdkVersion": 30,
-                    "hl": "en",
-                    "gl": "US",
-                    "utcOffsetMinutes": 0
-                }
-            }
-        }))
-        .send()
-        .unwrap()
-        .text()
-        .unwrap()
+fn tokio_rt() -> &'static Runtime {
+    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        return Builder::new_current_thread()
+        .enable_time()
+        .enable_io()
+        .build()
+        .expect("Setting up tokio runtime needs to succeed.");
+    })
 }
 
-fn on_activate(app: &Application) {
+fn create_ui(app: &Application) {
     let win = ApplicationWindow::builder()
         .application(app)
         .default_width(1280)
         .default_height(800)
-        .title("Hello, World!")
         .build();
 
-    let input_row = Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .hexpand(true)
-        .valign(gtk::Align::Start)
-        .spacing(10)
-        .margin_top(10)
-        .margin_start(10)
-        .margin_end(10)
-        .build();
+    let stack = gtk::Stack::builder().build();
 
-    let button = Button::builder().label("Fetch").width_request(160).build();
-    let input = Entry::builder().hexpand(true).text("dQw4w9WgXcQ").build();
+    let pic = Picture::builder().hexpand(true).vexpand(true).build();
+    let btn = gtk::Button::builder().label("Test").hexpand(false).vexpand(false).build();
 
-    input_row.append(&input);
-    input_row.append(&button);
+    stack.add_child(&btn);
+    stack.add_child(&pic);
 
-    button.connect_clicked(move |_btn: &Button| {
-        let id: String = input.text().into();
-        println!("{}", id);
-
-        let info = get_video_info(id.as_str());
-        let json: Value = serde_json::from_str(&info).unwrap();
-
-        println!("{}", json)
-    });
-
-    win.set_child(Some(&input_row));
-
+    win.set_child(Some(&stack));
     win.present();
+
+    let api_key = env::var("YOUTUBE_API_KEY").unwrap_or("".into());
+
+    btn.connect_clicked(move |_| {
+        let info = tokio_rt().block_on(async{
+            let list = ytlib::video_chart("UA", api_key.as_str()).await;
+            ytlib::get_video_info(list.items[0].id.as_str()).await
+        });
+
+        win.set_title(Some(&info.video_details.title));
+
+        let url = if let Some(formats) = info.streaming_data.formats {
+            if let Some(best) = ytlib::find_best_format(formats) {
+                Some(best.url.clone())
+            } else {
+                None
+            }
+        // todo: pick and process best audio/video pair
+        } else if let Some(formats) = info.streaming_data.adaptive_formats {
+            Some(formats[0].url.clone())
+        } else if let Some(hls) = info.streaming_data.hls_manifest_url {
+            Some(hls.clone())
+        } else if let Some(dash) = info.streaming_data.dash_manifest_url {
+            Some(dash.clone())
+        } else {
+            None
+        };
+
+        match url {
+            Some(url) => {
+                let picsink = gst::ElementFactory::make("gtk4paintablesink")
+                    .property("sync", true)
+                    .build()
+                    .unwrap();
+                pic.set_paintable(Some(&picsink.property::<gdk::Paintable>("paintable")));
+
+                let pipe = gstlib::make_pipeline(url, &picsink);
+
+                pipe.set_state(gst::State::Playing).unwrap();
+                stack.set_visible_child(&pic);
+            }
+            None => {
+                eprintln!("No url to play found");
+                return;
+            }
+        }
+    });
 }
 
-fn main() {
+fn main() { 
+    gst::init().unwrap();
+    gtk::init().unwrap();
+
+    gstgtk4::plugin_register_static().expect("Failed to register gstgtk4 plugin");
+
     let app = Application::builder()
         .application_id("org.example.ytp")
         .build();
 
-    app.connect_activate(on_activate);
+    app.connect_activate(create_ui);
     app.run();
 }
